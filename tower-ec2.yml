@@ -1,0 +1,125 @@
+- name: Provision ec2 instances based on the environment
+  hosts: localhost
+  connection: local
+  gather_facts: True
+
+  vars:
+     ec2_access_key: XXXXX
+     ec2_secret_key: XXXXXX
+     ansible_ssh_private_key_file: "/some/path"
+     ansible_ssh_user: "ec2-user"
+     ansible_password: "password"
+     tower_lic: "{{ lookup('file', '/some/path') | from_json }}"
+
+  tasks:
+  - name: Provision simple instance
+    ec2:
+      ec2_access_key: "{{ ec2_access_key }}"
+      ec2_secret_key: "{{ ec2_secret_key }}"
+      region: ap-southeast-2
+      key_name: "{{ aws_keys }}"
+      group: "{{ security_group }}"
+      instance_type: t2.xlarge
+      image: ami-67589505
+      wait: true
+      count: "{{ instance_count }}"
+      count_tag:
+        Name: "{{ instance_name }}"
+      instance_tags:
+        Name: "{{ instance_tags }}"
+    register: ec2
+  - name: Wait for machines to come up completely
+    wait_for: host={{ item.public_dns_name }} port=22
+    with_items: '{{ec2.instances}}'
+  - name: ping to get facts
+    ping:
+  - name: Set fact
+    set_fact: 
+      ec2_ip: "{{ ec2.instances[0].public_ip }}"
+  - name: Download latest pip to remote node
+    get_url: 
+      url: https://bootstrap.pypa.io/get-pip.py
+      dest: /tmp
+    delegate_to: "{{ ec2_ip }}"
+  - name: Install pip
+    become: yes
+    become_user: root
+    shell: python /tmp/get-pip.py
+    delegate_to: "{{ ec2_ip }}"
+  - name: Install tower-cli
+    become: yes
+    become_user: root
+    pip:
+      name: ansible-tower-cli
+    delegate_to: "{{ ec2_ip }}"
+  - name: Download latest tower locally on control node
+    get_url: 
+      url: https://releases.ansible.com/ansible-tower/setup/ansible-tower-setup-latest.tar.gz
+      dest: /tmp
+  - name: Copy tower installer to EC2 instance "{{ ec2_ip }}"
+    copy:
+      src: /tmp/ansible-tower-setup-latest.tar.gz
+      dest: /tmp/ansible-tower-setup-latest.tar.gz
+      mode: 0644
+    delegate_to:  "{{ ec2_ip }}"
+  - name: Unarchive ansible installer
+    unarchive: 
+      src: /tmp/ansible-tower-setup-latest.tar.gz
+      dest: /tmp
+    delegate_to: "{{ ec2_ip }}"
+  - name: get ansible directory name
+    become: yes
+    become_user: root
+    shell: find /tmp -type d -name 'ansible-tower-setup*'
+    register: remote_ansible_dir
+    delegate_to: "{{ ec2_ip }}"
+  - name: Update inventory file - admin password
+    replace:
+      path: "{{ remote_ansible_dir.stdout }}/inventory"
+      regexp: "admin_password=''"
+      replace: "admin_password='{{ ansible_password }}'"
+    delegate_to: "{{ ec2_ip }}"
+  - name: Update inventory file - pg password
+    replace:
+      path: "{{ remote_ansible_dir.stdout }}/inventory"
+      regexp: "pg_password=''"
+      replace: "pg_password='{{ ansible_password }}'"
+    delegate_to: "{{ ec2_ip }}"
+  - name: Update inventory file - rabbitmq password
+    replace:
+      path: "{{ remote_ansible_dir.stdout }}/inventory"
+      regexp: "rabbitmq_password=''"
+      replace: "rabbitmq_password='{{ ansible_password }}'"
+    delegate_to: "{{ ec2_ip }}"
+  - name: Update preflight minimum requirements
+    replace:
+      path: "{{ remote_ansible_dir.stdout }}/roles/preflight/defaults/main.yml"
+      regexp: "required_ram: 1750"
+      replace: "required_ram: 1"
+    delegate_to: "{{ ec2_ip }}"
+  - name: Run the installer
+    become: yes
+    become_user: root
+    shell: "{{ remote_ansible_dir.stdout }}/setup.sh"
+    register: installer_output
+    delegate_to: "{{ ec2_ip }}"
+  - name: Add EULA acceptance for license
+    set_fact:
+      tower_lic: "{{ tower_lic | default([]) | combine({ 'eula_accepted': 'true' }) }}"
+  - name: Tower license
+    uri:
+      url: "https://{{ inventory_hostname }}/api/v2/config/"
+      method: POST
+      validate_certs: no
+      user: admin
+      password: "{{ ansible_password }}"
+      status_code: 200
+      body: "{{ tower_lic }}"
+      body_format: json 
+    delegate_to: "{{ ec2_ip }}"
+  - name: Set tower-cli config
+    shell: tower-cli config username admin
+    delegate_to: "{{ ec2_ip }}"
+  - name: Set tower-cli config
+    shell: tower-cli config password "{{ ansible_password }}"
+    delegate_to: "{{ ec2_ip }}"
